@@ -1156,8 +1156,7 @@ bootstrap() {
     case "$target_dir" in /root/*) ;; *) fail 'Каталог установки должен находиться внутри /root/.' ;; esac
     case "$target_dir" in *[!A-Za-z0-9_./-]*|*/../*|*/..|*/./*|*/.|*//*) fail 'Недопустимый каталог установки.' ;; esac
     [ "$target_dir" != /root/ ] && [ ! -L "$target_dir" ] || fail 'Укажите отдельный обычный каталог проекта.'
-    if [ -e "$target_dir" ]; then
-        [ -f "$target_dir/install.sh" ] && [ -d "$target_dir/www" ] || fail "Каталог $target_dir занят."
+    if [ -e "$target_dir" ] && [ -f "$target_dir/install.sh" ] && [ -d "$target_dir/www" ]; then
         exec sh "$target_dir/install.sh" "$@"
     fi
     mkdir -p "$(dirname "$target_dir")"
@@ -1194,8 +1193,12 @@ bootstrap() {
     SOURCE="$project_root/www"
     validate_source
     sh -n "$project_root/install.sh"
-    [ ! -e "$target_dir" ] || fail 'Каталог установки появился во время загрузки.'
-    mv "$project_root" "$target_dir"
+    if [ -e "$target_dir" ]; then
+        [ -d "$target_dir" ] || fail 'Каталог установки занят не каталогом.'
+        cp -R "$project_root/." "$target_dir/"
+    else
+        mv "$project_root" "$target_dir"
+    fi
     bootstrap_cleanup
     TEMP=''
     BOOT_LOCKED=0
