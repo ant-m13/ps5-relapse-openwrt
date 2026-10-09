@@ -1,0 +1,147 @@
+#!/bin/sh
+# List local ELF files and save their autoload order. Files are never executed on the router.
+set -eu
+umask 077
+LC_ALL=C
+export LC_ALL
+ROOT_PREFIX=''
+if [ "${PS5OW_TEST_MODE:-0}" = 1 ]; then ROOT_PREFIX=${PS5OW_TEST_ROOT:-}; fi
+BASE="$ROOT_PREFIX/etc/ps5-openwrt"
+LOCK="$ROOT_PREFIX/var/lock/ps5-payloads.lock"
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
+OPTIONAL="$(dirname "$SCRIPT_DIR")/payloads/optional"
+TEMP=''
+LOCKED=0
+RESPONDED=0
+reply() {
+    RESPONDED=1
+    printf 'Status: %s\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n' "$1"
+    printf '%s\n' "$2"
+}
+error() { reply "$1" "{\"error\":\"$2\"}"; exit 0; }
+cleanup() {
+    result=$?
+    trap - 0 INT TERM
+    [ -z "$TEMP" ] || rm -rf "$TEMP"
+    if [ "$LOCKED" = 1 ]; then rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true; fi
+    if [ "$result" -ne 0 ] && [ "$RESPONDED" = 0 ]; then reply '500 Internal Server Error' '{"error":"Не удалось выполнить операцию."}'; fi
+}
+trap cleanup 0
+trap 'exit 130' INT
+trap 'exit 143' TERM
+[ -s "$BASE/payloads.token" ] || error '503 Service Unavailable' 'Сначала завершите установку сервера.'
+token=$(cat "$BASE/payloads.token")
+provided_token=''
+case "${HTTP_AUTHORIZATION:-}" in
+    Bearer\ *) provided_token=${HTTP_AUTHORIZATION#Bearer } ;;
+esac
+console_ip=$(uci -q get ps5openwrt.main.ip 2>/dev/null || true)
+console_allowed=0
+if [ "${HTTP_X_PS5_REQUEST:-}" = 1 ] && [ -n "$console_ip" ] && [ "${REMOTE_ADDR:-}" = "$console_ip" ]; then
+    console_allowed=1
+fi
+if [ "$console_allowed" != 1 ]; then
+    [ -n "$provided_token" ] && [ "$provided_token" = "$token" ] ||
+        error '401 Unauthorized' 'Введите код доступа из SSH.'
+fi
+case "${QUERY_STRING:-}" in
+    action=list) action=list ;;
+    action=manifest) action=manifest ;;
+    action=upload*) action=upload ;;
+    *) error '400 Bad Request' 'Неизвестная операция.' ;;
+esac
+case "$action:${REQUEST_METHOD:-}" in
+    list:GET|manifest:POST|upload:POST) ;;
+    *) error '405 Method Not Allowed' 'Метод не поддерживается.' ;;
+esac
+[ -d "$OPTIONAL" ] && [ ! -L "$OPTIONAL" ] || error '503 Service Unavailable' 'Нет каталога нагрузок.'
+mkdir -p "$(dirname "$LOCK")"
+if ! mkdir "$LOCK" 2>/dev/null; then
+    lock_pid=$(cat "$LOCK/pid" 2>/dev/null || true)
+    case "$lock_pid" in ''|*[!0-9]*) error '409 Conflict' 'Каталог нагрузок занят.' ;; esac
+    if kill -0 "$lock_pid" 2>/dev/null; then error '409 Conflict' 'Другая операция ещё выполняется.'; fi
+    rm -f "$LOCK/pid"
+    rmdir "$LOCK"
+    mkdir "$LOCK"
+fi
+LOCKED=1
+printf '%s\n' "$$" > "$LOCK/pid"
+TEMP=$(mktemp -d "$OPTIONAL/.manage.XXXXXX")
+valid_name() {
+    [ "${#1}" -le 128 ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]*\.elf$'
+}
+canonical_manifest() {
+    manifest_file=$1
+    first_char=$(sed '/^[[:space:]]*$/d' "$manifest_file" | head -n 1 | sed 's/^[[:space:]]*//' | cut -c 1)
+    flat=$(tr -d ' \t\r\n' < "$manifest_file")
+    printf '%s\n' "$flat" | grep -Eq '^\[("[A-Za-z0-9][A-Za-z0-9_.-]*\.elf"(,"[A-Za-z0-9][A-Za-z0-9_.-]*\.elf")*)?\]$' ||
+        error '400 Bad Request' 'Нужен массив имён ELF-файлов.'
+    [ "$first_char" = '[' ] || error '400 Bad Request' 'Нужен массив имён ELF-файлов.'
+    jsonfilter -i "$manifest_file" -e '@[*]' > "$TEMP/names" || error '400 Bad Request' 'Некорректный JSON.'
+    : > "$TEMP/seen"
+    printf '[' > "$TEMP/manifest.json"
+    separator=''
+    while IFS= read -r payload_name; do
+        valid_name "$payload_name" || error '400 Bad Request' 'Недопустимое имя ELF-файла.'
+        [ -s "$OPTIONAL/$payload_name" ] && [ ! -L "$OPTIONAL/$payload_name" ] ||
+            error '400 Bad Request' 'Указанный ELF-файл отсутствует.'
+        if grep -Fx "$payload_name" "$TEMP/seen" >/dev/null; then error '400 Bad Request' 'Имена в списке повторяются.'; fi
+        printf '%s\n' "$payload_name" >> "$TEMP/seen"
+        printf '%s"%s"' "$separator" "$payload_name" >> "$TEMP/manifest.json"
+        separator=','
+    done < "$TEMP/names"
+    printf ']\n' >> "$TEMP/manifest.json"
+}
+case "$action" in
+    upload)
+        [ "$provided_token" = "$token" ] || error '401 Unauthorized' 'Для загрузки введите код доступа из SSH.'
+        filename=${HTTP_X_PS5_FILENAME:-}
+        case "${QUERY_STRING:-}" in
+            *'filename='*) filename=${QUERY_STRING#*filename=}; filename=${filename%%&*} ;;
+        esac
+        filename=$(printf '%s' "$filename" | sed 's/%20/ /g; s/%2E/./g; s/%2e/./g; s/%2D/-/g; s/%2d/-/g; s/%5F/_/g; s/%5f/_/g')
+        valid_name "$filename" || error '400 Bad Request' 'Недопустимое имя ELF-файла.'
+        [ ! -e "$OPTIONAL/$filename" ] && [ ! -L "$OPTIONAL/$filename" ] || error '409 Conflict' 'Файл с таким именем уже существует.'
+        case "${CONTENT_LENGTH:-}" in ''|*[!0-9]*) error '400 Bad Request' 'Некорректный размер файла.' ;; esac
+        [ "${#CONTENT_LENGTH}" -le 7 ] && [ "$CONTENT_LENGTH" -ge 4 ] && [ "$CONTENT_LENGTH" -le 8388608 ] || error '413 Payload Too Large' 'Размер ELF должен быть от 4 байт до 8 МиБ.'
+        available=$(df -Pk "$OPTIONAL" | awk 'NR==2 {print $4}')
+        case "$available" in ''|*[!0-9]*) error '500 Internal Server Error' 'Не удалось проверить свободное место.' ;; esac
+        [ "$available" -ge "$(( (CONTENT_LENGTH + 1023) / 1024 + 1024 ))" ] || error '507 Insufficient Storage' 'На роутере недостаточно свободного места.'
+        head -c "$CONTENT_LENGTH" > "$TEMP/upload"
+        [ "$(wc -c < "$TEMP/upload")" -eq "$CONTENT_LENGTH" ] || error '400 Bad Request' 'Файл передан не полностью.'
+        printf '\177ELF' > "$TEMP/magic"
+        head -c 4 "$TEMP/upload" > "$TEMP/header"
+        cmp -s "$TEMP/header" "$TEMP/magic" || error '400 Bad Request' 'Файл не содержит заголовок ELF.'
+        chmod 644 "$TEMP/upload"
+        ln "$TEMP/upload" "$OPTIONAL/$filename" || error '409 Conflict' 'Не удалось добавить файл.'
+        reply '200 OK' '{"uploaded":true}'
+        ;;
+    list)
+        canonical_manifest "$OPTIONAL/manifest.json"
+        printf '{"files":[' > "$TEMP/response"
+        separator=''
+        for file in "$OPTIONAL"/*.elf; do
+            [ -f "$file" ] && [ ! -L "$file" ] || continue
+            filename=$(basename "$file")
+            valid_name "$filename" || continue
+            printf '%s{"name":"%s","size":%s}' "$separator" "$filename" "$(wc -c < "$file" | tr -d ' ')" >> "$TEMP/response"
+            separator=','
+        done
+        printf '],"autoload":' >> "$TEMP/response"
+        cat "$TEMP/manifest.json" >> "$TEMP/response"
+        printf ',"maxBytes":8388608}' >> "$TEMP/response"
+        reply '200 OK' "$(cat "$TEMP/response")"
+        ;;
+    manifest)
+        [ -n "${CONTENT_LENGTH:-}" ] || error '400 Bad Request' 'Не указан размер запроса.'
+        case "$CONTENT_LENGTH" in *[!0-9]*) error '400 Bad Request' 'Некорректный размер запроса.' ;; esac
+        [ "${#CONTENT_LENGTH}" -le 5 ] && [ "$CONTENT_LENGTH" -le 16384 ] ||
+            error '413 Payload Too Large' 'Список нагрузок слишком велик.'
+        head -c "$CONTENT_LENGTH" > "$TEMP/body"
+        [ "$(wc -c < "$TEMP/body")" -eq "$CONTENT_LENGTH" ] || error '400 Bad Request' 'Список передан не полностью.'
+        canonical_manifest "$TEMP/body"
+        chmod 644 "$TEMP/manifest.json"
+        mv "$TEMP/manifest.json" "$OPTIONAL/manifest.json"
+        reply '200 OK' '{"saved":true}'
+        ;;
+esac

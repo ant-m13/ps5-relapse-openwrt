@@ -1,0 +1,6 @@
+# Private backups and keys
+backups/
+*.pem
+*.key
+*.crt
+*.token
